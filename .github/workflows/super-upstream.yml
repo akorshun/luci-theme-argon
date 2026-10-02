@@ -1,0 +1,244 @@
+name: Super-upstream build
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if a release for the upstream commit exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: super-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: jerrykuku/luci-theme-argon
+  UPSTREAM_BRANCH: master
+  CONFIG_REPO: jerrykuku/luci-app-argon-config
+  CONFIG_BRANCH: master
+
+jobs:
+  sync:
+    name: Sync fork with upstream
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.up.outputs.sha }}
+      short: ${{ steps.up.outputs.short }}
+      release: ${{ steps.up.outputs.release }}
+      tag: ${{ steps.up.outputs.tag }}
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        id: up
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          ref="upstream/${UPSTREAM_BRANCH}"
+          sha="$(git rev-parse "$ref")"
+          short="$(git rev-parse --short=7 "$ref")"
+          version="$(git show "$ref:Makefile" | sed -n 's/^PKG_VERSION:=//p')"
+          # YYYYMMDDHH of the upstream commit (UTC): grows with every commit,
+          # beats upstream's own 8-digit PKG_RELEASE and still fits an int32.
+          release="$(TZ=UTC git log -1 --date=format-local:%Y%m%d%H --format=%cd "$ref")"
+          tag="v${version}-r${release}-g${short}"
+          {
+            echo "sha=$sha"
+            echo "short=$short"
+            echo "release=$release"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+          echo "Upstream: $sha ($tag)"
+
+      - name: Merge upstream into fork
+        # A failed sync must not block the build: packages are built from the
+        # upstream commit itself, not from this branch.
+        continue-on-error: true
+        run: |
+          bash .github/super-upstream/sync.sh "upstream/${UPSTREAM_BRANCH}"
+          git push origin HEAD:master
+
+      - name: Need a build?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.up.outputs.tag }}
+          FORCE: ${{ inputs.force || 'false' }}
+        run: |
+          if [ "$FORCE" != "true" ] && gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Keep the schedule alive
+        # GitHub disables cron workflows after 60 days without repo activity.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/super-upstream.yml/enable" || true
+
+  build:
+    name: Build ${{ matrix.format }} (OpenWrt ${{ matrix.series }})
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - format: ipk
+            series: "24.10"
+          - format: apk
+            series: "25.12"
+    steps:
+      - name: Checkout upstream commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.sync.outputs.sha }}
+          path: src/luci-theme-argon
+
+      - name: Checkout luci-app-argon-config
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CONFIG_REPO }}
+          ref: ${{ env.CONFIG_BRANCH }}
+          path: src/luci-app-argon-config
+
+      - name: Install build dependencies
+        run: |
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3 python3-setuptools python3-venv rsync unzip zlib1g-dev \
+            file wget curl xz-utils zstd
+
+      - name: Resolve latest OpenWrt ${{ matrix.series }} SDK
+        id: sdk
+        env:
+          SERIES: ${{ matrix.series }}
+        run: |
+          rel="$(curl -fsSL https://downloads.openwrt.org/releases/ |
+            grep -oE "${SERIES}\.[0-9]+/" | tr -d / | sort -uV | tail -n1)"
+          [ -n "$rel" ] || { echo "::error::No OpenWrt $SERIES release found"; exit 1; }
+          base="https://downloads.openwrt.org/releases/$rel/targets/x86/64"
+          line="$(curl -fsSL "$base/sha256sums" |
+            grep -E '[[:space:]]\*?openwrt-sdk-.*Linux-x86_64\.tar\.(zst|xz)$' | head -n1)"
+          [ -n "$line" ] || { echo "::error::No SDK in $base"; exit 1; }
+          file="$(echo "$line" | awk '{print $2}' | sed 's/^\*//')"
+          {
+            echo "openwrt=$rel"
+            echo "url=$base/$file"
+            echo "file=$file"
+            echo "sha256=$(echo "$line" | awk '{print $1}')"
+          } >> "$GITHUB_OUTPUT"
+          echo "SDK: $base/$file"
+
+      - name: Cache SDK archive
+        uses: actions/cache@v4
+        with:
+          path: .cache/${{ steps.sdk.outputs.file }}
+          key: sdk-${{ steps.sdk.outputs.sha256 }}
+
+      - name: Unpack SDK
+        env:
+          URL: ${{ steps.sdk.outputs.url }}
+          FILE: ${{ steps.sdk.outputs.file }}
+          SHA256: ${{ steps.sdk.outputs.sha256 }}
+        run: |
+          mkdir -p .cache sdk
+          [ -f ".cache/$FILE" ] || curl -fsSL "$URL" -o ".cache/$FILE"
+          echo "$SHA256  .cache/$FILE" | sha256sum -c -
+          tar -xf ".cache/$FILE" -C sdk --strip-components=1
+
+      - name: Prepare feeds and packages
+        working-directory: sdk
+        env:
+          PKG_REL: ${{ needs.sync.outputs.release }}
+        run: |
+          ./scripts/feeds update -a >/dev/null
+          ./scripts/feeds install -a >/dev/null
+          rsync -a --exclude=.git ../src/luci-theme-argon/ package/luci-theme-argon/
+          rsync -a --exclude=.git ../src/luci-app-argon-config/ package/luci-app-argon-config/
+          sed -i -E "s/^PKG_RELEASE:=.*/PKG_RELEASE:=${PKG_REL}/" package/luci-theme-argon/Makefile
+          grep -E '^PKG_(VERSION|RELEASE):=' package/luci-theme-argon/Makefile package/luci-app-argon-config/Makefile
+          printf '%s\n' \
+            'CONFIG_ALL_NONSHARED=n' \
+            'CONFIG_ALL_KMODS=n' \
+            'CONFIG_ALL=n' \
+            'CONFIG_AUTOREMOVE=n' \
+            'CONFIG_LUCI_LANG_ru=y' \
+            'CONFIG_LUCI_LANG_zh_Hans=y' \
+            'CONFIG_PACKAGE_luci-theme-argon=m' \
+            'CONFIG_PACKAGE_luci-app-argon-config=m' > .config
+          make defconfig >/dev/null
+
+      - name: Compile
+        working-directory: sdk
+        run: |
+          make package/luci-theme-argon/compile package/luci-app-argon-config/compile -j"$(nproc)" ||
+            make package/luci-theme-argon/compile package/luci-app-argon-config/compile -j1 V=s
+
+      - name: Collect packages
+        env:
+          FORMAT: ${{ matrix.format }}
+        run: |
+          mkdir -p out
+          find sdk/bin/packages -type f -name "*.$FORMAT" \
+            \( -name 'luci-theme-argon*' -o -name 'luci-app-argon-config*' -o -name 'luci-i18n-argon-config*' \) \
+            -exec cp -v {} out/ \;
+          ls out/luci-theme-argon* out/luci-app-argon-config*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.format }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [sync, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          pattern: packages-*
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.sync.outputs.tag }}
+          SHA: ${{ needs.sync.outputs.sha }}
+          SHORT: ${{ needs.sync.outputs.short }}
+        run: |
+          commit="$(gh api "repos/${UPSTREAM_REPO}/commits/${SHA}")"
+          date="$(jq -r .commit.committer.date <<<"$commit")"
+          msg="$(jq -r .commit.message <<<"$commit" | sed 's/^/> /')"
+          cfg="$(gh api "repos/${CONFIG_REPO}/commits/${CONFIG_BRANCH}" --jq .sha)"
+          {
+            echo "Unmodified Argon built from upstream commit [\`${SHORT}\`](https://github.com/${UPSTREAM_REPO}/commit/${SHA}) (${date}):"
+            echo
+            echo "$msg"
+            echo
+            echo "luci-app-argon-config: [\`${cfg:0:7}\`](https://github.com/${CONFIG_REPO}/commit/${cfg}) (\`${CONFIG_BRANCH}\`)."
+            echo
+            echo "- \`*.ipk\` — OpenWrt 24.10 (opkg): \`opkg install ./luci-theme-argon_*_all.ipk\`"
+            echo "- \`*.apk\` — OpenWrt 25.12 / snapshots (apk): \`apk add --allow-untrusted ./luci-theme-argon-*.apk\`"
+          } > notes.md
+          gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --cleanup-tag -y 2>/dev/null || true
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target master \
+            --title "Argon ${TAG#v} (upstream ${SHORT})" --notes-file notes.md --latest assets/*
